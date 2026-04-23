@@ -1,0 +1,527 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import pickle
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import accuracy_score
+
+# ============================================
+# MANUAL FAIRNESS METRICS (no fairlearn needed)
+# ============================================
+
+def demographic_parity_difference(y_true, y_pred, sensitive_features):
+    groups = np.unique(sensitive_features)
+    rates = []
+    for g in groups:
+        mask = (sensitive_features == g)
+        if np.sum(mask) > 0:
+            rate = np.mean(y_pred[mask])
+            rates.append(rate)
+    return np.max(rates) - np.min(rates)
+
+def equalized_odds_difference(y_true, y_pred, sensitive_features):
+    groups = np.unique(sensitive_features)
+    tprs = []
+    fprs = []
+    for g in groups:
+        mask = (sensitive_features == g)
+        y_true_g = y_true[mask]
+        y_pred_g = y_pred[mask]
+        tp = np.sum((y_pred_g == 1) & (y_true_g == 1))
+        fn = np.sum((y_pred_g == 0) & (y_true_g == 1))
+        fp = np.sum((y_pred_g == 1) & (y_true_g == 0))
+        tn = np.sum((y_pred_g == 0) & (y_true_g == 0))
+        tpr = tp / (tp + fn) if (tp + fn) > 0 else 0
+        fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
+        tprs.append(tpr)
+        fprs.append(fpr)
+    return max(np.max(tprs) - np.min(tprs), np.max(fprs) - np.min(fprs))
+
+# ============================================
+# BIAS DETECTION FUNCTIONS
+# ============================================
+
+def calculate_disparate_impact(df, sensitive_col, privileged_group, unprivileged_group, outcome_col, favorable_outcome=1):
+    privileged = df[df[sensitive_col] == privileged_group]
+    unprivileged = df[df[sensitive_col] == unprivileged_group]
+    rate_privileged = (privileged[outcome_col] == favorable_outcome).mean()
+    rate_unprivileged = (unprivileged[outcome_col] == favorable_outcome).mean()
+    if rate_privileged == 0:
+        return float('inf'), 0, 0
+    di = rate_unprivileged / rate_privileged
+    return di, rate_privileged, rate_unprivileged
+
+def get_bias_flag(di):
+    if di < 0.8:
+        return "🔴 HIGH BIAS", "Unprivileged group is disadvantaged (DI < 0.8)", "red"
+    elif di > 1.25:
+        return "🟡 REVERSE BIAS", "Privileged group is disadvantaged (DI > 1.25)", "orange"
+    else:
+        return "🟢 FAIR", "No significant adverse impact (0.8 ≤ DI ≤ 1.25)", "green"
+
+def reweight_dataset(df, sensitive_col, privileged_group, unprivileged_group, outcome_col, favorable_outcome=1):
+    df_fixed = df.copy()
+    priv_mask = (df_fixed[sensitive_col] == privileged_group)
+    unpriv_mask = (df_fixed[sensitive_col] == unprivileged_group)
+    rate_priv = (df_fixed.loc[priv_mask, outcome_col] == favorable_outcome).mean()
+    rate_unpriv = (df_fixed.loc[unpriv_mask, outcome_col] == favorable_outcome).mean()
+    if rate_unpriv >= rate_priv:
+        return df_fixed, "No reweighting needed (unprivileged rate already higher or equal)"
+    priv_favorable = df_fixed[(priv_mask) & (df_fixed[outcome_col] == favorable_outcome)]
+    unpriv_favorable = df_fixed[(unpriv_mask) & (df_fixed[outcome_col] == favorable_outcome)]
+    if len(priv_favorable) == 0 or len(unpriv_favorable) == 0:
+        return df_fixed, "Cannot reweight – one group has zero favorable outcomes."
+    target_unpriv_favorable_count = int(len(priv_favorable) * (rate_priv / rate_unpriv))
+    needed = max(0, target_unpriv_favorable_count - len(unpriv_favorable))
+    if needed > 0:
+        additional = unpriv_favorable.sample(n=min(needed, len(unpriv_favorable)), replace=True)
+        df_fixed = pd.concat([df_fixed, additional], ignore_index=True)
+    return df_fixed, f"Added {needed} rows from unprivileged favorable group."
+
+def threshold_adjustment(df, sensitive_col, privileged_group, unprivileged_group, score_col, favorable_outcome=1):
+    df_fixed = df.copy()
+    if score_col not in df.columns:
+        return df_fixed, "Score column not found."
+    unpriv = df_fixed[df_fixed[sensitive_col] == unprivileged_group]
+    priv = df_fixed[df_fixed[sensitive_col] == privileged_group]
+    current_rate_priv = (priv[outcome_col] == favorable_outcome).mean()
+    unpriv_sorted = unpriv.sort_values(score_col, ascending=False)
+    target_count = int(current_rate_priv * len(unpriv))
+    if 0 < target_count <= len(unpriv):
+        threshold = unpriv_sorted.iloc[min(target_count, len(unpriv_sorted)-1)][score_col]
+        new_approvals = df_fixed[score_col] >= threshold
+        df_fixed.loc[df_fixed[sensitive_col] == unprivileged_group, outcome_col] = new_approvals.loc[df_fixed[sensitive_col] == unprivileged_group].astype(int)
+        message = f"Adjusted threshold to {threshold:.3f}. Unprivileged group now has same approval rate ({current_rate_priv:.2%}) as privileged."
+    else:
+        message = "Cannot adjust threshold – target count out of range."
+    return df_fixed, message
+
+# ============================================
+# MODEL INSPECTION FUNCTIONS
+# ============================================
+
+def load_model(uploaded_file):
+    return pickle.loads(uploaded_file.read())
+
+def calculate_model_fairness_metrics(model, X_test, y_test, sensitive_attr):
+    y_pred = model.predict(X_test)
+    dp_diff = demographic_parity_difference(y_test, y_pred, sensitive_attr)
+    eq_odds_diff = equalized_odds_difference(y_test, y_pred, sensitive_attr)
+    acc = accuracy_score(y_test, y_pred)
+    return {"Demographic Parity Difference": dp_diff, "Equalized Odds Difference": eq_odds_diff, "Accuracy": acc}, y_pred
+
+def postprocess_fairness(y_pred, sensitive_attr, privileged_group, unprivileged_group, flip_ratio=0.1):
+    y_fixed = y_pred.copy()
+    unpriv_mask = (sensitive_attr == unprivileged_group)
+    n_flip = int(np.sum(unpriv_mask) * flip_ratio)
+    flip_indices = np.where(unpriv_mask)[0][:n_flip]
+    y_fixed[flip_indices] = 1 - y_fixed[flip_indices]
+    return y_fixed
+
+# ============================================
+# STREAMLIT UI WITH SESSION STATE
+# ============================================
+
+st.set_page_config(page_title="FairLens - Bias Detector & Fixer", layout="wide")
+st.title("🔍 FairLens: Bias Detection & Mitigation")
+st.markdown("Upload your dataset, detect hidden discrimination, and fix it with one click.")
+
+# Initialise data bias session state keys
+if "df" not in st.session_state:
+    st.session_state.df = None
+if "sensitive_col" not in st.session_state:
+    st.session_state.sensitive_col = None
+if "outcome_col" not in st.session_state:
+    st.session_state.outcome_col = None
+if "privileged_group" not in st.session_state:
+    st.session_state.privileged_group = None
+if "unprivileged_group" not in st.session_state:
+    st.session_state.unprivileged_group = None
+if "favorable_outcome" not in st.session_state:
+    st.session_state.favorable_outcome = 1
+if "analysis_done" not in st.session_state:
+    st.session_state.analysis_done = False
+if "di" not in st.session_state:
+    st.session_state.di = None
+if "rate_priv" not in st.session_state:
+    st.session_state.rate_priv = None
+if "rate_unpriv" not in st.session_state:
+    st.session_state.rate_unpriv = None
+if "outcome_col_enc" not in st.session_state:
+    st.session_state.outcome_col_enc = None
+if "favorable_encoded" not in st.session_state:
+    st.session_state.favorable_encoded = None
+if "original_df" not in st.session_state:
+    st.session_state.original_df = None
+
+# Initialise model inspection session state keys
+if "model_uploaded" not in st.session_state:
+    st.session_state.model_uploaded = None
+if "test_df" not in st.session_state:
+    st.session_state.test_df = None
+if "model" not in st.session_state:
+    st.session_state.model = None
+if "model_sensitive_col" not in st.session_state:
+    st.session_state.model_sensitive_col = None
+if "model_outcome_col" not in st.session_state:
+    st.session_state.model_outcome_col = None
+if "model_privileged" not in st.session_state:
+    st.session_state.model_privileged = None
+if "model_unprivileged" not in st.session_state:
+    st.session_state.model_unprivileged = None
+if "model_fav_outcome" not in st.session_state:
+    st.session_state.model_fav_outcome = 1
+if "model_evaluated" not in st.session_state:
+    st.session_state.model_evaluated = False
+if "model_metrics" not in st.session_state:
+    st.session_state.model_metrics = None
+if "y_pred_original" not in st.session_state:
+    st.session_state.y_pred_original = None
+if "y_test" not in st.session_state:
+    st.session_state.y_test = None
+if "sensitive_attr_values" not in st.session_state:
+    st.session_state.sensitive_attr_values = None
+
+# ============================================
+# SIDEBAR: Data upload and configuration
+# ============================================
+
+with st.sidebar:
+    st.header("⚙️ Settings")
+    uploaded_file = st.file_uploader("Upload CSV file", type=["csv"], key="file_uploader")
+    
+    if uploaded_file is not None:
+        if st.session_state.df is None or st.session_state.get("last_uploaded") != uploaded_file.name:
+            st.session_state.df = pd.read_csv(uploaded_file)
+            st.session_state.original_df = st.session_state.df.copy()
+            st.session_state.last_uploaded = uploaded_file.name
+            st.session_state.analysis_done = False
+            # Reset any previous model evaluation to avoid confusion
+            st.session_state.model_evaluated = False
+        st.success(f"Loaded {st.session_state.df.shape[0]} rows, {st.session_state.df.shape[1]} columns")
+        
+        # Only show column selectors if data is loaded
+        if st.session_state.df is not None:
+            st.session_state.sensitive_col = st.selectbox(
+                "Sensitive Attribute (e.g., gender, race)",
+                st.session_state.df.columns,
+                index=st.session_state.df.columns.get_loc(st.session_state.sensitive_col) if st.session_state.sensitive_col in st.session_state.df.columns else 0,
+                key="sensitive_select"
+            )
+            st.session_state.outcome_col = st.selectbox(
+                "Outcome Column (e.g., approved, hired)",
+                st.session_state.df.columns,
+                index=st.session_state.df.columns.get_loc(st.session_state.outcome_col) if st.session_state.outcome_col in st.session_state.df.columns else 0,
+                key="outcome_select"
+            )
+            unique_vals = st.session_state.df[st.session_state.sensitive_col].unique()
+            st.session_state.privileged_group = st.selectbox(
+                "Privileged Group",
+                unique_vals,
+                index=list(unique_vals).index(st.session_state.privileged_group) if st.session_state.privileged_group in unique_vals else 0,
+                key="priv_select"
+            )
+            st.session_state.unprivileged_group = st.selectbox(
+                "Unprivileged Group",
+                [v for v in unique_vals if v != st.session_state.privileged_group],
+                key="unpriv_select"
+            )
+            st.session_state.favorable_outcome = st.number_input(
+                "Favorable outcome value (e.g., 1 for approved)",
+                value=st.session_state.favorable_outcome,
+                key="fav_outcome"
+            )
+            
+            if st.button("🚀 Run Bias Analysis", key="run_analysis"):
+                df = st.session_state.df
+                # Encode outcome if needed
+                if df[st.session_state.outcome_col].dtype == 'object':
+                    le = LabelEncoder()
+                    df[st.session_state.outcome_col + "_encoded"] = le.fit_transform(df[st.session_state.outcome_col])
+                    st.session_state.outcome_col_enc = st.session_state.outcome_col + "_encoded"
+                    st.session_state.favorable_encoded = le.transform([str(st.session_state.favorable_outcome)])[0] if str(st.session_state.favorable_outcome) in le.classes_ else st.session_state.favorable_outcome
+                else:
+                    st.session_state.outcome_col_enc = st.session_state.outcome_col
+                    st.session_state.favorable_encoded = st.session_state.favorable_outcome
+                
+                di, rate_priv, rate_unpriv = calculate_disparate_impact(
+                    df,
+                    st.session_state.sensitive_col,
+                    st.session_state.privileged_group,
+                    st.session_state.unprivileged_group,
+                    st.session_state.outcome_col_enc,
+                    st.session_state.favorable_encoded
+                )
+                st.session_state.di = di
+                st.session_state.rate_priv = rate_priv
+                st.session_state.rate_unpriv = rate_unpriv
+                st.session_state.analysis_done = True
+                st.rerun()
+
+# ============================================
+# MAIN CONTENT AREA (Data bias report & fixes)
+# ============================================
+
+if st.session_state.analysis_done:
+    di = st.session_state.di
+    rate_priv = st.session_state.rate_priv
+    rate_unpriv = st.session_state.rate_unpriv
+    sensitive_col = st.session_state.sensitive_col
+    privileged_group = st.session_state.privileged_group
+    unprivileged_group = st.session_state.unprivileged_group
+    outcome_col_enc = st.session_state.outcome_col_enc
+    favorable_encoded = st.session_state.favorable_encoded
+    df = st.session_state.df
+
+    st.subheader("📊 Bias Analysis Report")
+    flag, message, color = get_bias_flag(di)
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Disparate Impact", f"{di:.3f}")
+    with col2:
+        st.metric(f"Privileged ({privileged_group}) Rate", f"{rate_priv:.2%}")
+    with col3:
+        st.metric(f"Unprivileged ({unprivileged_group}) Rate", f"{rate_unpriv:.2%}")
+
+    st.markdown(f"## {flag}")
+    st.markdown(f"<p style='color:{color}; font-size:18px'>{message}</p>", unsafe_allow_html=True)
+
+    with st.expander("📖 What does Disparate Impact mean?"):
+        st.markdown("""
+        **Disparate Impact (DI)** = Rate for unprivileged group / Rate for privileged group.
+        - DI < 0.8 → Adverse impact (bias against unprivileged group).
+        - 0.8 ≤ DI ≤ 1.25 → Generally fair.
+        - DI > 1.25 → Reverse bias.
+        """)
+
+    st.subheader("📋 Outcome Rates by Group")
+    rates = df.groupby(sensitive_col)[outcome_col_enc].apply(lambda x: (x == favorable_encoded).mean())
+    rates_df = pd.DataFrame({"Favorable Outcome Rate": rates}).reset_index()
+    rates_df["Favorable Outcome Rate"] = rates_df["Favorable Outcome Rate"].apply(lambda x: f"{x:.2%}")
+    st.table(rates_df)
+
+    # --- MODEL INSPECTION SECTION (session-state aware) ---
+    st.markdown("---")
+    st.subheader("🤖 Model Inspection (Optional)")
+    st.markdown("Upload a trained ML model and test dataset to check for algorithmic bias.")
+
+    with st.expander("📦 Upload Model & Test Data"):
+        model_file = st.file_uploader("Upload trained model (pickle file)", type=["pkl", "pickle"], key="model_uploader")
+        test_file = st.file_uploader("Upload test dataset (CSV)", type=["csv"], key="test_uploader")
+
+        if model_file is not None:
+            if st.session_state.get("last_model_name") != model_file.name:
+                st.session_state.model = load_model(model_file)
+                st.session_state.last_model_name = model_file.name
+                st.session_state.model_evaluated = False
+                st.success("Model loaded successfully.")
+
+        if test_file is not None:
+            if st.session_state.get("last_test_name") != test_file.name:
+                st.session_state.test_df = pd.read_csv(test_file)
+                st.session_state.last_test_name = test_file.name
+                st.session_state.model_evaluated = False
+                st.success(f"Test set loaded: {len(st.session_state.test_df)} rows.")
+
+        if st.session_state.model is not None and st.session_state.test_df is not None:
+            test_df = st.session_state.test_df
+            st.session_state.model_sensitive_col = st.selectbox(
+                "Sensitive attribute column in test set",
+                test_df.columns,
+                index=test_df.columns.get_loc(st.session_state.model_sensitive_col) if st.session_state.model_sensitive_col in test_df.columns else 0,
+                key="model_sensitive_select"
+            )
+            st.session_state.model_outcome_col = st.selectbox(
+                "True outcome column in test set",
+                test_df.columns,
+                index=test_df.columns.get_loc(st.session_state.model_outcome_col) if st.session_state.model_outcome_col in test_df.columns else 0,
+                key="model_outcome_select"
+            )
+            unique_vals = test_df[st.session_state.model_sensitive_col].unique()
+            st.session_state.model_privileged = st.selectbox(
+                "Privileged group value",
+                unique_vals,
+                index=list(unique_vals).index(st.session_state.model_privileged) if st.session_state.model_privileged in unique_vals else 0,
+                key="model_priv_select"
+            )
+            st.session_state.model_unprivileged = st.selectbox(
+                "Unprivileged group value",
+                [v for v in unique_vals if v != st.session_state.model_privileged],
+                key="model_unpriv_select"
+            )
+            st.session_state.model_fav_outcome = st.number_input(
+                "Favorable outcome value",
+                value=st.session_state.model_fav_outcome,
+                key="model_fav_input"
+            )
+
+            if st.button("🔍 Evaluate Model Fairness", key="eval_model_btn"):
+                with st.spinner("Evaluating model..."):
+                    try:
+                        feature_cols = [c for c in test_df.columns if c not in [st.session_state.model_sensitive_col, st.session_state.model_outcome_col]]
+                        X_test = test_df[feature_cols]
+                        y_test = (test_df[st.session_state.model_outcome_col] == st.session_state.model_fav_outcome).astype(int)
+                        sensitive_attr = test_df[st.session_state.model_sensitive_col]
+
+                        metrics, y_pred = calculate_model_fairness_metrics(
+                            st.session_state.model, X_test, y_test, sensitive_attr
+                        )
+                        st.session_state.model_metrics = metrics
+                        st.session_state.y_pred_original = y_pred
+                        st.session_state.y_test = y_test
+                        st.session_state.sensitive_attr_values = sensitive_attr
+                        st.session_state.model_evaluated = True
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Evaluation error: {e}")
+
+    # Display results if model has been evaluated
+    if st.session_state.model_evaluated:
+        metrics = st.session_state.model_metrics
+        st.subheader("📊 Model Fairness Report")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("Accuracy", f"{metrics['Accuracy']:.2%}")
+        with c2:
+            st.metric("Demographic Parity Diff", f"{metrics['Demographic Parity Difference']:.3f}")
+        with c3:
+            st.metric("Equalized Odds Diff", f"{metrics['Equalized Odds Difference']:.3f}")
+
+        if metrics['Demographic Parity Difference'] > 0.1:
+            st.warning("⚠️ Demographic parity difference > 0.1 – model may favor one group.")
+        else:
+            st.success("✅ Demographic parity difference is acceptable (≤ 0.1).")
+
+        st.markdown("---")
+        st.subheader("🔧 Post-Processing Fairness Fix")
+        flip_ratio = st.slider("Flip ratio for unprivileged group predictions", 0.0, 0.5, 0.1, 0.05, key="flip_slider")
+        if st.button("Apply Post-Processing Fix", key="postprocess_btn"):
+            with st.spinner("Applying fix..."):
+                y_fixed = postprocess_fairness(
+                    st.session_state.y_pred_original,
+                    st.session_state.sensitive_attr_values,
+                    st.session_state.model_privileged,
+                    st.session_state.model_unprivileged,
+                    flip_ratio
+                )
+                dp_fixed = demographic_parity_difference(
+                    st.session_state.y_test, y_fixed, st.session_state.sensitive_attr_values
+                )
+                eq_fixed = equalized_odds_difference(
+                    st.session_state.y_test, y_fixed, st.session_state.sensitive_attr_values
+                )
+                acc_fixed = accuracy_score(st.session_state.y_test, y_fixed)
+
+                st.write("**After post‑processing:**")
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("New Accuracy", f"{acc_fixed:.2%}",
+                              delta=f"{acc_fixed - metrics['Accuracy']:.2%}")
+                with col2:
+                    st.metric("New Demo. Parity Diff", f"{dp_fixed:.3f}",
+                              delta=f"{dp_fixed - metrics['Demographic Parity Difference']:.3f}")
+                with col3:
+                    st.metric("New Equal. Odds Diff", f"{eq_fixed:.3f}",
+                              delta=f"{eq_fixed - metrics['Equalized Odds Difference']:.3f}")
+
+                if dp_fixed < 0.1:
+                    st.success("✅ Model now meets demographic parity threshold!")
+                else:
+                    st.warning("⚠️ Still some disparity – try a higher flip ratio or other mitigation.")
+
+                # Download fixed predictions
+                if st.session_state.test_df is not None:
+                    pred_df = st.session_state.test_df.copy()
+                    pred_df['original_prediction'] = st.session_state.y_pred_original
+                    pred_df['fixed_prediction'] = y_fixed
+                    csv_fixed = pred_df.to_csv(index=False).encode('utf-8')
+                    st.download_button("📥 Download Predictions (Fixed)", csv_fixed,
+                                       "fixed_predictions.csv", "text/csv", key="download_fixed_preds")
+
+    # --- DATA FIX SECTION (for the original dataset) ---
+    if di < 0.8 or di > 1.25:
+        st.markdown("---")
+        st.subheader("🔧 Fix the Detected Bias in Data")
+
+        fix_method = st.radio("Choose mitigation method:", ["Reweighting (adjust dataset)", "Threshold Adjustment (decision rule)"], key="fix_method_radio")
+
+        if fix_method == "Reweighting (adjust dataset)":
+            if st.button("Apply Reweighting", key="reweight_btn"):
+                with st.spinner("Reweighting dataset..."):
+                    df_fixed, msg = reweight_dataset(
+                        df, sensitive_col, privileged_group, unprivileged_group,
+                        outcome_col_enc, favorable_encoded
+                    )
+                    st.success(msg)
+                    st.session_state.df = df_fixed
+                    di_fixed, rate_priv_fixed, rate_unpriv_fixed = calculate_disparate_impact(
+                        df_fixed, sensitive_col, privileged_group, unprivileged_group,
+                        outcome_col_enc, favorable_encoded
+                    )
+                    st.session_state.di = di_fixed
+                    st.session_state.rate_priv = rate_priv_fixed
+                    st.session_state.rate_unpriv = rate_unpriv_fixed
+                    st.rerun()
+        else:
+            numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+            if not numeric_cols:
+                st.error("No numeric columns for threshold adjustment. Use reweighting.")
+            else:
+                score_col = st.selectbox("Select probability/score column", numeric_cols, key="score_col_select")
+                if st.button("Apply Threshold Adjustment", key="threshold_btn"):
+                    with st.spinner("Adjusting thresholds..."):
+                        df_fixed, msg = threshold_adjustment(
+                            df, sensitive_col, privileged_group, unprivileged_group,
+                            score_col, favorable_encoded
+                        )
+                        st.info(msg)
+                        st.session_state.df = df_fixed
+                        di_fixed, rate_priv_fixed, rate_unpriv_fixed = calculate_disparate_impact(
+                            df_fixed, sensitive_col, privileged_group, unprivileged_group,
+                            outcome_col_enc, favorable_encoded
+                        )
+                        st.session_state.di = di_fixed
+                        st.session_state.rate_priv = rate_priv_fixed
+                        st.session_state.rate_unpriv = rate_unpriv_fixed
+                        st.rerun()
+
+        # Download the current (possibly fixed) dataset
+        csv = st.session_state.df.to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Download Current Dataset (Fixed)", csv, "fairlens_fixed.csv", "text/csv", key="download_fixed")
+
+        if st.button("Reset to Original Data", key="reset_btn"):
+            st.session_state.df = st.session_state.original_df.copy()
+            di_orig, rate_priv_orig, rate_unpriv_orig = calculate_disparate_impact(
+                st.session_state.df, sensitive_col, privileged_group, unprivileged_group,
+                outcome_col_enc, favorable_encoded
+            )
+            st.session_state.di = di_orig
+            st.session_state.rate_priv = rate_priv_orig
+            st.session_state.rate_unpriv = rate_unpriv_orig
+            st.rerun()
+    else:
+        st.success("🎉 Dataset is already fair! No fix needed.")
+        csv = st.session_state.df.to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Download Dataset", csv, "fair_dataset.csv", "text/csv")
+
+elif st.session_state.df is not None and not st.session_state.analysis_done:
+    st.info("👈 Click 'Run Bias Analysis' to start.")
+else:
+    st.info("👈 Upload a CSV file to begin")
+    with st.expander("📁 Generate a biased sample dataset"):
+        st.code("""
+import pandas as pd
+import numpy as np
+np.random.seed(42)
+n = 1000
+gender = np.random.choice(['Male','Female'], n)
+credit_score = np.random.normal(650, 50, n)
+prob_approve = 1/(1+np.exp(-(credit_score-600)/100))
+prob_approve[gender=='Female'] *= 0.7
+approved = np.random.binomial(1, prob_approve)
+df = pd.DataFrame({'gender':gender,'credit_score':credit_score,'approved':approved})
+df.to_csv('loans_biased.csv', index=False)
+print("Created loans_biased.csv")
+""")
