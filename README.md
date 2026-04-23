@@ -27,7 +27,7 @@ AI models making decisions about jobs, loans, and healthcare often learn histori
 
 ### Clone & Setup
 ```bash
-git clone https://github.com/yourusername/fairlens.git
+git clone https://github.com/hitesh-11-lab/fairlens.git
 cd fairlens
 python -m venv venv
 source venv/bin/activate   # On Windows: venv\Scripts\activate
