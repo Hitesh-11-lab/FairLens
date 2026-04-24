@@ -8,17 +8,30 @@ from sklearn.metrics import accuracy_score
 import google.generativeai as genai
 
 # ============================================
-# GEMINI EXPLANATION FUNCTION
+# GEMINI EXPLANATION FUNCTION (auto-model discovery)
 # ============================================
 
 def get_gemini_explanation(di, rate_priv, rate_unpriv, privileged_group, unprivileged_group):
     """
     Calls Gemini API to generate a plain‑English explanation of bias metrics.
-    Requires API key stored in Streamlit secrets.
+    Dynamically finds any model that supports 'generateContent'.
     """
     try:
         genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-        model = genai.GenerativeModel('gemini-pro')
+
+        # List all available models and pick the first supporting generateContent
+        models = genai.list_models()
+        suitable_model = None
+        for model in models:
+            if 'generateContent' in model.supported_generation_methods:
+                suitable_model = model.name
+                break
+
+        if suitable_model is None:
+            return "⚠️ No generative model found. Check your API key permissions and enable the Generative Language API."
+
+        model = genai.GenerativeModel(suitable_model)
+
         prompt = f"""
 You are a fairness auditor. A dataset shows:
 - Disparate Impact (DI) = {di:.3f}
@@ -38,10 +51,10 @@ Provide a short (max 150 words) explanation for a non‑technical manager. Inclu
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
-        return f"⚠️ Gemini explanation failed: {e}. Check API key and internet connection."
+        return f"⚠️ Gemini explanation failed: {e}. Verify API key, enable Generative Language API, and check internet."
 
 # ============================================
-# MANUAL FAIRNESS METRICS (no fairlearn needed)
+# MANUAL FAIRNESS METRICS
 # ============================================
 
 def demographic_parity_difference(y_true, y_pred, sensitive_features):
@@ -187,14 +200,14 @@ def postprocess_fairness(y_pred, sensitive_attr, privileged_group, unprivileged_
     return y_fixed
 
 # ============================================
-# STREAMLIT UI WITH SESSION STATE
+# STREAMLIT UI (with session state)
 # ============================================
 
 st.set_page_config(page_title="FairLens - Bias Detector & Fixer", layout="wide")
 st.title("🔍 FairLens: Bias Detection & Mitigation")
 st.markdown("Upload your dataset, detect hidden discrimination, and fix it with one click.")
 
-# Session state initialisation (same as before)
+# --- Session state initialisation (same as before, compact) ---
 if "df" not in st.session_state:
     st.session_state.df = None
 if "sensitive_col" not in st.session_state:
@@ -223,12 +236,10 @@ if "original_df" not in st.session_state:
     st.session_state.original_df = None
 
 # Model inspection session state
-if "model_uploaded" not in st.session_state:
-    st.session_state.model_uploaded = None
-if "test_df" not in st.session_state:
-    st.session_state.test_df = None
 if "model" not in st.session_state:
     st.session_state.model = None
+if "test_df" not in st.session_state:
+    st.session_state.test_df = None
 if "model_sensitive_col" not in st.session_state:
     st.session_state.model_sensitive_col = None
 if "model_outcome_col" not in st.session_state:
@@ -264,7 +275,6 @@ with st.sidebar:
             st.session_state.original_df = st.session_state.df.copy()
             st.session_state.last_uploaded = uploaded_file.name
             st.session_state.analysis_done = False
-            st.session_state.model_evaluated = False
         st.success(f"Loaded {st.session_state.df.shape[0]} rows, {st.session_state.df.shape[1]} columns")
 
         if st.session_state.df is not None:
@@ -282,7 +292,7 @@ with st.sidebar:
             )
             if st.session_state.outcome_col:
                 unique_vals = st.session_state.df[st.session_state.outcome_col].dropna().unique()
-                st.caption(f"📌 Unique values: {', '.join(str(v) for v in unique_vals)}")
+                st.caption(f"📌 Unique values in outcome column: {', '.join(str(v) for v in unique_vals)}")
 
             unique_vals = st.session_state.df[st.session_state.sensitive_col].unique()
             st.session_state.privileged_group = st.selectbox(
@@ -328,7 +338,7 @@ with st.sidebar:
                 st.rerun()
 
 # ============================================
-# MAIN CONTENT
+# MAIN CONTENT (bias report, Gemini, fixes, model inspection)
 # ============================================
 
 if st.session_state.analysis_done:
@@ -381,7 +391,7 @@ if st.session_state.analysis_done:
     rates_df["Favorable Outcome Rate"] = rates_df["Favorable Outcome Rate"].apply(lambda x: f"{x:.2%}")
     st.table(rates_df)
 
-    # --- MODEL INSPECTION (unchanged, but for brevity I keep it compact) ---
+    # --- MODEL INSPECTION (compact, with state) ---
     st.markdown("---")
     st.subheader("🤖 Model Inspection (Optional)")
     st.markdown("Upload a trained ML model and test dataset to check for algorithmic bias.")
@@ -489,7 +499,7 @@ if st.session_state.analysis_done:
         else:
             numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
             if numeric_cols:
-                score_col = st.selectbox("Score column", numeric_cols, key="score_col_select")
+                score_col = st.selectbox("Score column (e.g., probability)", numeric_cols, key="score_col_select")
                 if st.button("Apply Threshold Adjustment", key="threshold_btn"):
                     with st.spinner("Adjusting..."):
                         df_fixed, msg = threshold_adjustment(df, sensitive_col, privileged_group, unprivileged_group, score_col, favorable_val)
@@ -502,6 +512,7 @@ if st.session_state.analysis_done:
                         st.rerun()
             else:
                 st.error("No numeric columns for threshold adjustment. Use reweighting.")
+
         csv = st.session_state.df.to_csv(index=False).encode('utf-8')
         st.download_button("📥 Download Current Dataset (Fixed)", csv, "fairlens_fixed.csv", "text/csv", key="download_fixed")
         if st.button("Reset to Original Data", key="reset_btn"):
