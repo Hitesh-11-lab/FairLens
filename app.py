@@ -18,7 +18,7 @@ def get_gemini_explanation(di, rate_priv, rate_unpriv, privileged_group, unprivi
     """
     try:
         genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-        model = genai.GenerativeModel('gemini-1.5-pro')
+        model = genai.GenerativeModel('gemini-pro')
         prompt = f"""
 You are a fairness auditor. A dataset shows:
 - Disparate Impact (DI) = {di:.3f}
