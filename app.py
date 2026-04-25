@@ -393,7 +393,7 @@ if st.session_state.analysis_done:
 
     # --- MODEL INSPECTION (compact, with state) ---
     st.markdown("---")
-    st.subheader("🤖 Model Inspection (Optional)")
+    st.subheader("🤖 Model Inspection")
     st.markdown("Upload a trained ML model and test dataset to check for algorithmic bias.")
     with st.expander("📦 Upload Model & Test Data"):
         model_file = st.file_uploader("Upload trained model (pickle file)", type=["pkl", "pickle"], key="model_uploader")
